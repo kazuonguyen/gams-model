@@ -406,118 +406,177 @@ def evaluate_and_plot(gam, X_test, y_test, feature_names, scaler_y, output_dir):
     print(f"MAPE: {mape:.2f}%")
     print(f"{'='*70}")
     
-    # ============================================================
-    # PLOT 1: Main evaluation (6 subplots)
-    # ============================================================
-    fig = plt.figure(figsize=(24, 16))
+    # Shared data
+    residuals = actuals - predictions
+    t = np.arange(len(actuals))
+    abs_errors = np.abs(residuals)
     
-    # 1a. Scatter với REGRESSION LINE
-    ax1 = plt.subplot(2, 3, 1)
-    ax1.scatter(actuals, predictions, alpha=0.6, c='#2ecc71', s=80,
+    # ============================================================
+    # PLOT 1: Scatter với LOWESS/Polynomial Fit
+    # ============================================================
+    print("\n[Plots] Generating individual evaluation plots...")
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.scatter(actuals, predictions, alpha=0.6, c='#2ecc71', s=100,
                edgecolors='black', linewidth=1, zorder=3)
     
     # Perfect fit line (45°)
     min_val = min(actuals.min(), predictions.min())
     max_val = max(actuals.max(), predictions.max())
-    ax1.plot([min_val, max_val], [min_val, max_val], '--', color='gray',
-            linewidth=1.5, alpha=0.5, label='Perfect y=x')
+    ax.plot([min_val, max_val], [min_val, max_val], '--', color='gray',
+            linewidth=2, alpha=0.5, label='Perfect y=x')
     
     # LOWESS smoothing
     try:
         from statsmodels.nonparametric.smoothers_lowess import lowess
         sort_idx = np.argsort(actuals)
         lowess_result = lowess(predictions[sort_idx], actuals[sort_idx], frac=0.4)
-        ax1.plot(lowess_result[:, 0], lowess_result[:, 1], 'r-', linewidth=3,
+        ax.plot(lowess_result[:, 0], lowess_result[:, 1], 'r-', linewidth=3,
                 label='LOWESS Fit', zorder=6)
     except ImportError:
         z = np.polyfit(actuals, predictions, 3)
         p = np.poly1d(z)
         x_smooth = np.linspace(actuals.min(), actuals.max(), 200)
-        ax1.plot(x_smooth, p(x_smooth), 'r-', linewidth=3, label='Trend', zorder=5)
+        ax.plot(x_smooth, p(x_smooth), 'r-', linewidth=3, label='Polynomial Fit', zorder=5)
     
-    ax1.set_xlabel('Actual Deaths', fontsize=14, fontweight='bold')
-    ax1.set_ylabel('Predicted Deaths', fontsize=14, fontweight='bold')
-    ax1.set_title('GAM v2 Predictions vs Actual', fontsize=16, fontweight='bold')
-    ax1.legend(fontsize=11)
-    ax1.grid(True, alpha=0.3)
+    ax.set_xlabel('Actual Deaths', fontsize=16, fontweight='bold')
+    ax.set_ylabel('Predicted Deaths', fontsize=16, fontweight='bold')
+    ax.set_title('GAM v2: Predictions vs Actual', fontsize=18, fontweight='bold', pad=20)
+    ax.legend(fontsize=13)
+    ax.grid(True, alpha=0.3)
     
     stats_text = f"MAE: {mae:.2f}\nRMSE: {rmse:.2f}\nR²: {r2:.4f}\nMAPE: {mape:.1f}%"
-    ax1.text(0.05, 0.95, stats_text, transform=ax1.transAxes, va='top',
+    ax.text(0.05, 0.95, stats_text, transform=ax.transAxes, va='top',
             bbox=dict(boxstyle='round', facecolor='gold', alpha=0.9),
-            fontsize=13, fontweight='bold')
+            fontsize=14, fontweight='bold')
     
-    # 1b. Time series
-    ax2 = plt.subplot(2, 3, 2)
-    t = np.arange(len(actuals))
-    ax2.plot(t, actuals, 'o-', label='Actual', color='black',
-            linewidth=3, markersize=6, alpha=0.8, zorder=3)
-    ax2.plot(t, predictions, 's-', label='Predicted', color='#2ecc71',
-            linewidth=2.5, markersize=5, alpha=0.8, zorder=2)
-    ax2.set_xlabel('Sample Index', fontsize=14, fontweight='bold')
-    ax2.set_ylabel('Deaths', fontsize=14, fontweight='bold')
-    ax2.set_title('Time Series Predictions', fontsize=16, fontweight='bold')
-    ax2.legend(fontsize=12)
-    ax2.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, '1_scatter_plot.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✅ 1_scatter_plot.png")
     
-    # 1c. Residuals
-    ax3 = plt.subplot(2, 3, 3)
-    residuals = actuals - predictions
-    ax3.scatter(predictions, residuals, alpha=0.6, c='#3498db', s=60,
+    # ============================================================
+    # PLOT 2: Time Series
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.plot(t, actuals, 'o-', label='Actual', color='black',
+            linewidth=3, markersize=7, alpha=0.8, zorder=3)
+    ax.plot(t, predictions, 's-', label='Predicted', color='#2ecc71',
+            linewidth=2.5, markersize=6, alpha=0.8, zorder=2)
+    ax.set_xlabel('Sample Index (Test Set)', fontsize=16, fontweight='bold')
+    ax.set_ylabel('Deaths', fontsize=16, fontweight='bold')
+    ax.set_title('Time Series: Actual vs Predicted Deaths', fontsize=18, fontweight='bold', pad=20)
+    ax.legend(fontsize=13, loc='best')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, '2_time_series.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✅ 2_time_series.png")
+    
+    # ============================================================
+    # PLOT 3: Residuals
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.scatter(predictions, residuals, alpha=0.6, c='#3498db', s=80,
                edgecolors='black', linewidth=0.5)
-    ax3.axhline(y=0, color='r', linestyle='--', linewidth=3)
-    ax3.set_xlabel('Predicted Deaths', fontsize=14, fontweight='bold')
-    ax3.set_ylabel('Residuals', fontsize=14, fontweight='bold')
-    ax3.set_title('Residual Plot', fontsize=16, fontweight='bold')
-    ax3.grid(True, alpha=0.3)
+    ax.axhline(y=0, color='r', linestyle='--', linewidth=3, label='Zero Line')
     
-    # 1d. Error distribution
-    ax4 = plt.subplot(2, 3, 4)
-    ax4.hist(residuals, bins=25, color='#9b59b6', alpha=0.7, edgecolor='black')
-    ax4.axvline(x=0, color='r', linestyle='--', linewidth=3)
-    ax4.axvline(x=residuals.mean(), color='orange', linestyle='--', linewidth=2,
-               label=f'Mean: {residuals.mean():.2f}')
-    ax4.set_xlabel('Residuals', fontsize=14, fontweight='bold')
-    ax4.set_ylabel('Frequency', fontsize=14, fontweight='bold')
-    ax4.set_title('Residual Distribution', fontsize=16, fontweight='bold')
-    ax4.legend(fontsize=11)
-    ax4.grid(True, alpha=0.3, axis='y')
+    # Add horizontal lines at ±1 std
+    std_resid = residuals.std()
+    ax.axhline(y=std_resid, color='orange', linestyle=':', linewidth=2, alpha=0.7, label=f'±1σ = ±{std_resid:.2f}')
+    ax.axhline(y=-std_resid, color='orange', linestyle=':', linewidth=2, alpha=0.7)
     
-    # 1e. Absolute errors
-    ax5 = plt.subplot(2, 3, 5)
-    abs_errors = np.abs(residuals)
-    ax5.plot(t, abs_errors, 'o-', color='#e74c3c', linewidth=2.5, markersize=5)
-    ax5.axhline(y=mae, color='black', linestyle='--', linewidth=3,
-               label=f'MAE: {mae:.2f}')
-    ax5.set_xlabel('Sample Index', fontsize=14, fontweight='bold')
-    ax5.set_ylabel('Absolute Error', fontsize=14, fontweight='bold')
-    ax5.set_title('Errors Over Time', fontsize=16, fontweight='bold')
-    ax5.legend(fontsize=12)
-    ax5.grid(True, alpha=0.3)
+    ax.set_xlabel('Predicted Deaths', fontsize=16, fontweight='bold')
+    ax.set_ylabel('Residuals (Actual - Predicted)', fontsize=16, fontweight='bold')
+    ax.set_title('Residual Plot', fontsize=18, fontweight='bold', pad=20)
+    ax.legend(fontsize=12)
+    ax.grid(True, alpha=0.3)
     
-    # 1f. Prediction intervals
-    ax6 = plt.subplot(2, 3, 6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, '3_residuals.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✅ 3_residuals.png")
+    
+    # ============================================================
+    # PLOT 4: Error Distribution (Histogram)
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(10, 7))
+    n, bins, patches = ax.hist(residuals, bins=30, color='#9b59b6', alpha=0.7, edgecolor='black')
+    
+    # Overlay normal distribution
+    mu, sigma = residuals.mean(), residuals.std()
+    x_norm = np.linspace(residuals.min(), residuals.max(), 100)
+    y_norm = ((1 / (np.sqrt(2 * np.pi) * sigma)) * np.exp(-0.5 * ((x_norm - mu) / sigma)**2)) * len(residuals) * (bins[1] - bins[0])
+    ax.plot(x_norm, y_norm, 'r-', linewidth=3, label=f'Normal(μ={mu:.2f}, σ={sigma:.2f})')
+    
+    ax.axvline(x=0, color='darkred', linestyle='--', linewidth=3, label='Zero')
+    ax.axvline(x=mu, color='orange', linestyle='--', linewidth=2, label=f'Mean: {mu:.2f}')
+    
+    ax.set_xlabel('Residuals', fontsize=16, fontweight='bold')
+    ax.set_ylabel('Frequency', fontsize=16, fontweight='bold')
+    ax.set_title('Residual Distribution', fontsize=18, fontweight='bold', pad=20)
+    ax.legend(fontsize=12)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, '4_residual_distribution.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✅ 4_residual_distribution.png")
+    
+    # ============================================================
+    # PLOT 5: Absolute Errors Over Time
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.plot(t, abs_errors, 'o-', color='#e74c3c', linewidth=2.5, markersize=6)
+    ax.axhline(y=mae, color='black', linestyle='--', linewidth=3, label=f'MAE: {mae:.2f}')
+    
+    # Add rolling mean of errors
+    window = min(7, len(abs_errors) // 5)
+    if window >= 2:
+        rolling_err = pd.Series(abs_errors).rolling(window, center=True).mean()
+        ax.plot(t, rolling_err, '-', color='blue', linewidth=3, alpha=0.6, 
+                label=f'Rolling Mean (window={window})')
+    
+    ax.set_xlabel('Sample Index (Test Set)', fontsize=16, fontweight='bold')
+    ax.set_ylabel('Absolute Error', fontsize=16, fontweight='bold')
+    ax.set_title('Absolute Errors Over Time', fontsize=18, fontweight='bold', pad=20)
+    ax.legend(fontsize=12)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, '5_errors_over_time.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✅ 5_errors_over_time.png")
+    
+    # ============================================================
+    # PLOT 6: Predictions with 95% Confidence Interval
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(14, 7))
+    
     try:
         pred_intervals = gam.prediction_intervals(X_test, width=0.95)
         ci_low = scaler_y.inverse_transform(pred_intervals[:, 0].reshape(-1, 1)).flatten()
         ci_high = scaler_y.inverse_transform(pred_intervals[:, 1].reshape(-1, 1)).flatten()
-        ax6.fill_between(t, ci_low, ci_high, alpha=0.2, color='#3498db', label='95% CI')
+        ax.fill_between(t, ci_low, ci_high, alpha=0.25, color='#3498db', label='95% Confidence Interval')
     except Exception:
         pass
     
-    ax6.plot(t, actuals, 'o-', label='Actual', color='black',
-            linewidth=3, markersize=6, alpha=0.8)
-    ax6.plot(t, predictions, 's-', label='Predicted', color='#2ecc71',
-            linewidth=2.5, markersize=5, alpha=0.8)
-    ax6.set_xlabel('Sample Index', fontsize=14, fontweight='bold')
-    ax6.set_ylabel('Deaths', fontsize=14, fontweight='bold')
-    ax6.set_title('Predictions with 95% Confidence Interval', fontsize=16, fontweight='bold')
-    ax6.legend(fontsize=11)
-    ax6.grid(True, alpha=0.3)
+    ax.plot(t, actuals, 'o-', label='Actual', color='black',
+            linewidth=3, markersize=7, alpha=0.8, zorder=3)
+    ax.plot(t, predictions, 's-', label='Predicted', color='#2ecc71',
+            linewidth=2.5, markersize=6, alpha=0.8, zorder=2)
+    
+    ax.set_xlabel('Sample Index (Test Set)', fontsize=16, fontweight='bold')
+    ax.set_ylabel('Deaths', fontsize=16, fontweight='bold')
+    ax.set_title('Predictions with 95% Confidence Intervals', fontsize=18, fontweight='bold', pad=20)
+    ax.legend(fontsize=12, loc='best')
+    ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'gam_evaluation.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, '6_confidence_intervals.png'), dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"\n✅ Saved: {output_dir}/gam_evaluation.png")
+    print(f"  ✅ 6_confidence_intervals.png")
     
     # ============================================================
     # PLOT 2: Top 12 feature effects (partial dependence)
@@ -563,9 +622,9 @@ def evaluate_and_plot(gam, X_test, y_test, feature_names, scaler_y, output_dir):
     plt.suptitle('GAM v2: Top Feature Effects (Partial Dependence)',
                 fontsize=18, fontweight='bold', y=1.02)
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'gam_feature_effects.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, '7_feature_effects.png'), dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"✅ Saved: {output_dir}/gam_feature_effects.png")
+    print(f"  ✅ 7_feature_effects.png")
     
     return {
         'mae': float(mae),
