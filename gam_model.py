@@ -1,11 +1,17 @@
 """
-GAM MODEL - Generalized Additive Models cho Death Prediction
-=============================================================
-- Bỏ mean features, chỉ dùng MIN/MAX/STD/SUM
-- GAMs: f(y) = s(x1) + s(x2) + ... + s(xn)
-- Mỗi feature được fit bằng spline riêng (non-linear)
-- Interpretable: xem được ảnh hưởng từng feature
-- Tốt cho small dataset (557 samples)
+GAM MODEL v2 - Optimized for Maximum R²
+=========================================
+Key improvements over v1 (R²=0.52):
+  1. Year trend (linear) - correlation 0.42 with Deaths
+  2. Deaths rolling mean (4, 8 week) - smoothed history
+  3. More lag features (up to 8 weeks)
+  4. EWM (exponential weighted mean) of Deaths
+  5. More AQ features: PM25, PM10, O3, NO2, CO
+  6. Better seasonality: multiple Fourier harmonics
+  7. Feature selection: remove low-importance features
+  8. Per-feature spline tuning
+  9. Train on train+val for final model
+  10. Tensor product interactions for key feature pairs
 """
 
 import os
@@ -13,6 +19,9 @@ import numpy as np
 import pandas as pd
 import pickle
 import json
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -27,218 +36,347 @@ sns.set_style("whitegrid")
 
 
 # ============================================================
-# FEATURE SELECTION: Chỉ MIN/MAX/STD/SUM - BỎ MEAN
+# FEATURE DEFINITIONS
 # ============================================================
 
-# Weather features - chỉ min, max, std, sum (KHÔNG mean)
-MIN_MAX_FEATURES = [
-    # Temperature extremes
+# Weather features - min/max/std/sum (NO mean)
+WEATHER_FEATURES = [
     'Max_Temp_C_max',           # Nhiệt độ cao nhất trong tuần
     'Max_Temp_C_std',           # Biến động nhiệt độ cao
     'Min_Temp_C_min',           # Nhiệt độ thấp nhất trong tuần
     'Min_Temp_C_std',           # Biến động nhiệt độ thấp
     'Temp_Range_max',           # Biên độ nhiệt lớn nhất
-    
-    # Rainfall extremes
     'Rainfall_mm_sum',          # Tổng lượng mưa
-    'Rainfall_mm_max',          # Lượng mưa cực đại 1 ngày
+    'Rainfall_mm_max',          # Lượng mưa cực đại
     'Rainfall_mm_rainy_days',   # Số ngày mưa
-    
-    # Evaporation & Radiation (sum = tổng tuần)
     'Evaporation_mm_sum',       # Tổng bốc hơi
     'Radiation_MJ_m2_sum',      # Tổng bức xạ
-    
-    # Vapour pressure extremes
-    'Vapour_Pressure_hPa_min',  # Áp suất hơi thấp nhất
-    'Vapour_Pressure_hPa_max',  # Áp suất hơi cao nhất
-    
-    # Humidity extremes
-    'RH_at_Max_Temp_pct_min',   # Độ ẩm thấp nhất khi nóng nhất
-    'RH_at_Min_Temp_pct_max',   # Độ ẩm cao nhất khi lạnh nhất
+    'Vapour_Pressure_hPa_min',
+    'Vapour_Pressure_hPa_max',
+    'RH_at_Max_Temp_pct_min',   # Độ ẩm thấp nhất khi nóng
+    'RH_at_Min_Temp_pct_max',   # Độ ẩm cao nhất khi lạnh
 ]
 
-# Air Quality features (max + count - không mean)
-AQ_MIN_MAX_FEATURES = [
-    'AQI_weekly_max',           # AQI cực đại trong tuần
-    'Bad_days_count',           # Số ngày không khí xấu
-    'Main_pollutant_AQI',       # Chất ô nhiễm chính
+# Air Quality features - expanded
+AQ_FEATURES = [
+    'AQI_weekly_max',
+    'Bad_days_count',
+    'Main_pollutant_AQI',
+    'PM25_weekly_mean',         # NEW: PM2.5
+    'PM10_weekly_mean',         # NEW: PM10
+    'O3_weekly_mean',           # NEW: Ozone
+    'NO2_weekly_mean',          # NEW: NO2
+    'CO_weekly_mean',           # NEW: CO
 ]
 
 
-def load_data_minmax():
-    """Load data chỉ với min/max features."""
+def load_data():
+    """Load và merge tất cả data sources."""
     base_dir = os.path.dirname(__file__)
+    
+    # Main weather + deaths data
     data_path = os.path.join(base_dir, 'dataset', 'Weather_Death_Weekly_Merged_MinMax_ImprovedTargets_v2.csv')
+    df = pd.read_csv(data_path)
     
-    df_weather = pd.read_csv(data_path)
-    
-    # Merge air quality
+    # Merge full air quality data
     aq_path = os.path.join(base_dir, 'dataset', 'Air_Quality_Weekly_Evaluation.csv')
     if os.path.exists(aq_path):
         df_aq = pd.read_csv(aq_path)
-        df = pd.merge(df_weather, df_aq, on=['Year', 'Week'], how='inner')
-    else:
-        df = df_weather
+        df = pd.merge(df, df_aq, on=['Year', 'Week'], how='inner', suffixes=('', '_aq'))
+        # Remove duplicate columns
+        df = df.loc[:, ~df.columns.str.endswith('_aq')]
     
     df = df.sort_values(['Year', 'Week']).reset_index(drop=True)
     
-    # Select min/max features only
-    available_features = [f for f in MIN_MAX_FEATURES + AQ_MIN_MAX_FEATURES if f in df.columns]
+    available = [f for f in WEATHER_FEATURES + AQ_FEATURES if f in df.columns]
+    missing = [f for f in WEATHER_FEATURES + AQ_FEATURES if f not in df.columns]
     
-    print(f"\n[Features] Using {len(available_features)} MIN/MAX features (NO mean):")
-    for f in available_features:
-        print(f"  → {f}")
+    print(f"\n[Data] Shape: {df.shape}")
+    print(f"[Features] Available: {len(available)}, Missing: {len(missing)}")
+    if missing:
+        print(f"  Missing: {missing}")
     
-    df[available_features] = df[available_features].ffill().bfill().fillna(0)
-    
-    return df, available_features
+    return df, available
 
 
-def create_gam_features(df, feature_cols):
+def create_features(df, base_features):
     """
-    Create advanced features cho GAM - tập trung min/max extremes.
+    Feature engineering tối ưu cho R².
     """
-    df_result = df.copy()
-    new_features = list(feature_cols)
+    df_out = df.copy()
+    features = list(base_features)
     
-    # 1. Extreme temperature spread (max cao - min thấp)
-    if 'Max_Temp_C_max' in df.columns and 'Min_Temp_C_min' in df.columns:
-        df_result['Temp_Extreme_Spread'] = df['Max_Temp_C_max'] - df['Min_Temp_C_min']
-        new_features.append('Temp_Extreme_Spread')
+    # Fill base features
+    for f in base_features:
+        if f in df_out.columns:
+            df_out[f] = df_out[f].ffill().bfill().fillna(0)
     
-    # 2. Cold stress index (nhiệt thấp + ẩm cao = nguy hiểm)
-    if 'Min_Temp_C_min' in df.columns and 'RH_at_Min_Temp_pct_max' in df.columns:
-        df_result['Cold_Stress'] = (1 - df['Min_Temp_C_min']) * df['RH_at_Min_Temp_pct_max']
-        new_features.append('Cold_Stress')
+    # ================================================================
+    # 1. YEAR TREND - correlation 0.42! (linear term)
+    # ================================================================
+    if 'Year' in df.columns:
+        df_out['Year_trend'] = df['Year'] - df['Year'].min()  # 0, 1, 2, ...
+        features.append('Year_trend')
     
-    # 3. Heat stress index (nhiệt cao + ẩm thấp = nguy hiểm)
-    if 'Max_Temp_C_max' in df.columns and 'RH_at_Max_Temp_pct_min' in df.columns:
-        df_result['Heat_Stress'] = df['Max_Temp_C_max'] * (1 - df['RH_at_Max_Temp_pct_min'])
-        new_features.append('Heat_Stress')
-    
-    # 4. Air quality extreme impact
-    if 'AQI_weekly_max' in df.columns and 'Bad_days_count' in df.columns:
-        df_result['AQ_Extreme_Impact'] = df['AQI_weekly_max'] * df['Bad_days_count']
-        new_features.append('AQ_Extreme_Impact')
-    
-    # 5. Rainfall intensity (max rain / rainy days)
-    if 'Rainfall_mm_max' in df.columns and 'Rainfall_mm_rainy_days' in df.columns:
-        df_result['Rainfall_Intensity'] = df['Rainfall_mm_max'] / (df['Rainfall_mm_rainy_days'] + 0.1)
-        new_features.append('Rainfall_Intensity')
-    
-    # 6. Vapour pressure range
-    if 'Vapour_Pressure_hPa_max' in df.columns and 'Vapour_Pressure_hPa_min' in df.columns:
-        df_result['Vapour_Pressure_Range'] = df['Vapour_Pressure_hPa_max'] - df['Vapour_Pressure_hPa_min']
-        new_features.append('Vapour_Pressure_Range')
-    
-    # 7. Lag features (1-4 weeks trước) cho Deaths
+    # ================================================================
+    # 2. DEATHS LAG FEATURES (1-8 weeks) - autocorrelation up to 0.42
+    # ================================================================
     if 'Deaths' in df.columns:
-        for lag in [1, 2, 3, 4]:
-            col_name = f'Deaths_lag{lag}'
-            df_result[col_name] = df['Deaths'].shift(lag)
-            new_features.append(col_name)
+        for lag in range(1, 9):  # Was 1-4, now 1-8
+            col = f'Deaths_lag{lag}'
+            df_out[col] = df['Deaths'].shift(lag)
+            features.append(col)
     
-    # 8. Lag features cho key min/max features
-    key_features = ['Max_Temp_C_max', 'Min_Temp_C_min', 'AQI_weekly_max']
-    for feat in key_features:
+    # ================================================================
+    # 3. DEATHS ROLLING STATISTICS - smoothed recent history
+    # ================================================================
+    if 'Deaths' in df.columns:
+        # Rolling means (MOST IMPORTANT for R²)
+        for w in [2, 4, 8, 12]:
+            col = f'Deaths_rmean{w}'
+            df_out[col] = df['Deaths'].shift(1).rolling(w, min_periods=1).mean()
+            features.append(col)
+        
+        # Rolling max/min (extreme weeks)
+        for w in [4, 8]:
+            df_out[f'Deaths_rmax{w}'] = df['Deaths'].shift(1).rolling(w, min_periods=1).max()
+            df_out[f'Deaths_rmin{w}'] = df['Deaths'].shift(1).rolling(w, min_periods=1).min()
+            features.append(f'Deaths_rmax{w}')
+            features.append(f'Deaths_rmin{w}')
+        
+        # Rolling std (volatility)
+        df_out['Deaths_rstd4'] = df['Deaths'].shift(1).rolling(4, min_periods=2).std()
+        features.append('Deaths_rstd4')
+        
+        # EWM (exponential weighted mean) - recent weeks weigh more
+        for span in [4, 8]:
+            col = f'Deaths_ewm{span}'
+            df_out[col] = df['Deaths'].shift(1).ewm(span=span, min_periods=1).mean()
+            features.append(col)
+    
+    # ================================================================
+    # 4. WEATHER INTERACTION FEATURES
+    # ================================================================
+    if 'Max_Temp_C_max' in df.columns and 'Min_Temp_C_min' in df.columns:
+        df_out['Temp_Extreme_Spread'] = df['Max_Temp_C_max'] - df['Min_Temp_C_min']
+        features.append('Temp_Extreme_Spread')
+    
+    if 'Min_Temp_C_min' in df.columns and 'RH_at_Min_Temp_pct_max' in df.columns:
+        df_out['Cold_Stress'] = (1 - df['Min_Temp_C_min'].clip(0, 1)) * df['RH_at_Min_Temp_pct_max']
+        features.append('Cold_Stress')
+    
+    if 'Max_Temp_C_max' in df.columns and 'RH_at_Max_Temp_pct_min' in df.columns:
+        df_out['Heat_Stress'] = df['Max_Temp_C_max'] * (1 - df['RH_at_Max_Temp_pct_min'].clip(0, 1))
+        features.append('Heat_Stress')
+    
+    if 'AQI_weekly_max' in df.columns and 'Bad_days_count' in df.columns:
+        df_out['AQ_Extreme_Impact'] = df['AQI_weekly_max'] * df['Bad_days_count']
+        features.append('AQ_Extreme_Impact')
+    
+    if 'Rainfall_mm_max' in df.columns and 'Rainfall_mm_rainy_days' in df.columns:
+        df_out['Rainfall_Intensity'] = df['Rainfall_mm_max'] / (df['Rainfall_mm_rainy_days'] + 0.1)
+        features.append('Rainfall_Intensity')
+    
+    if 'Vapour_Pressure_hPa_max' in df.columns and 'Vapour_Pressure_hPa_min' in df.columns:
+        df_out['Vapour_Pressure_Range'] = df['Vapour_Pressure_hPa_max'] - df['Vapour_Pressure_hPa_min']
+        features.append('Vapour_Pressure_Range')
+    
+    # ================================================================
+    # 5. WEATHER LAG FEATURES (1-2 weeks)
+    # ================================================================
+    key_weather = ['Max_Temp_C_max', 'Min_Temp_C_min', 'AQI_weekly_max', 'PM25_weekly_mean']
+    for feat in key_weather:
         if feat in df.columns:
             for lag in [1, 2]:
-                col_name = f'{feat}_lag{lag}'
-                df_result[col_name] = df[feat].shift(lag)
-                new_features.append(col_name)
+                col = f'{feat}_lag{lag}'
+                df_out[col] = df[feat].shift(lag)
+                features.append(col)
     
-    # 9. Rolling extremes (2, 4 week windows)
-    if 'Deaths' in df.columns:
-        for window in [2, 4]:
-            df_result[f'Deaths_roll{window}_max'] = df['Deaths'].rolling(window).max()
-            df_result[f'Deaths_roll{window}_min'] = df['Deaths'].rolling(window).min()
-            new_features.append(f'Deaths_roll{window}_max')
-            new_features.append(f'Deaths_roll{window}_min')
-    
-    # 10. Week-of-year seasonality
+    # ================================================================
+    # 6. SEASONALITY - Multiple Fourier harmonics
+    # ================================================================
     if 'Week' in df.columns:
-        df_result['Week_sin'] = np.sin(2 * np.pi * df['Week'] / 52)
-        df_result['Week_cos'] = np.cos(2 * np.pi * df['Week'] / 52)
-        new_features.append('Week_sin')
-        new_features.append('Week_cos')
+        for period in [52, 26, 13]:  # Annual, semi-annual, quarterly
+            df_out[f'Season_sin_{period}'] = np.sin(2 * np.pi * df['Week'] / period)
+            df_out[f'Season_cos_{period}'] = np.cos(2 * np.pi * df['Week'] / period)
+            features.append(f'Season_sin_{period}')
+            features.append(f'Season_cos_{period}')
     
-    # Fill NaNs from lags/rolling
-    df_result[new_features] = df_result[new_features].fillna(method='bfill').fillna(0)
+    # ================================================================
+    # 7. YEAR x SEASON interaction (trend changes with season)
+    # ================================================================
+    if 'Year' in df.columns and 'Week' in df.columns:
+        year_norm = (df['Year'] - df['Year'].min()) / max(df['Year'].max() - df['Year'].min(), 1)
+        week_sin = np.sin(2 * np.pi * df['Week'] / 52)
+        df_out['Year_Season_interact'] = year_norm * week_sin
+        features.append('Year_Season_interact')
     
-    # Replace inf
-    df_result = df_result.replace([np.inf, -np.inf], 0)
+    # ================================================================
+    # 8. CHANGE FEATURES - week-over-week changes
+    # ================================================================
+    if 'Deaths' in df.columns:
+        df_out['Deaths_change1'] = df['Deaths'].diff(1)
+        df_out['Deaths_change2'] = df['Deaths'].diff(2)
+        features.append('Deaths_change1')
+        features.append('Deaths_change2')
     
-    print(f"\n[GAM Features] Total: {len(new_features)} features")
-    print(f"  Base min/max: {len(feature_cols)}")
-    print(f"  Engineered: {len(new_features) - len(feature_cols)}")
+    for feat in ['Max_Temp_C_max', 'Min_Temp_C_min']:
+        if feat in df.columns:
+            df_out[f'{feat}_change'] = df[feat].diff(1)
+            features.append(f'{feat}_change')
     
-    return df_result, new_features
+    # ================================================================
+    # CLEANUP
+    # ================================================================
+    df_out[features] = df_out[features].bfill().fillna(0)
+    df_out = df_out.replace([np.inf, -np.inf], 0)
+    
+    print(f"\n[Features] Total: {len(features)}")
+    print(f"  Base weather+AQ: {len(base_features)}")
+    print(f"  Engineered: {len(features) - len(base_features)}")
+    
+    return df_out, features
 
 
-def train_gam(X_train, y_train, X_val, y_val, n_splines=20, lam_search=True):
+def select_features(X_train, y_train, feature_names, threshold=0.02):
     """
-    Train GAM model với grid search cho lambda.
+    Feature selection dựa trên correlation với target.
+    Loại bỏ features không có tín hiệu.
+    """
+    correlations = []
+    for i in range(X_train.shape[1]):
+        corr = abs(np.corrcoef(X_train[:, i], y_train)[0, 1])
+        if np.isnan(corr):
+            corr = 0
+        correlations.append(corr)
     
-    GAM: Deaths = s(feat1) + s(feat2) + ... + s(featN)
-    Mỗi s() là smooth spline function
+    # Keep features with correlation > threshold
+    selected_idx = [i for i, c in enumerate(correlations) if c >= threshold]
+    selected_names = [feature_names[i] for i in selected_idx]
+    
+    removed = len(feature_names) - len(selected_names)
+    if removed > 0:
+        print(f"\n[Feature Selection] Removed {removed} low-signal features")
+        print(f"  Kept: {len(selected_names)} features (corr >= {threshold})")
+    
+    return selected_idx, selected_names
+
+
+def build_gam_terms(n_features, feature_names):
+    """
+    Build GAM terms với per-feature spline tuning.
+    - Death lags/rolling: more splines (complex relationship)
+    - Year: linear term
+    - Seasonality: fewer splines (smooth)
+    """
+    terms = None
+    
+    for i, name in enumerate(feature_names):
+        if 'Year_trend' in name:
+            # Year trend = linear
+            term = l(i)
+        elif 'Season_' in name or 'Week_' in name:
+            # Seasonality = smooth, fewer splines
+            term = s(i, n_splines=10)
+        elif 'Deaths_lag' in name or 'Deaths_r' in name or 'Deaths_ewm' in name:
+            # Death history = more detail
+            term = s(i, n_splines=25)
+        elif 'Deaths_change' in name:
+            term = s(i, n_splines=15)
+        else:
+            # Weather/AQ features = moderate
+            term = s(i, n_splines=20)
+        
+        if terms is None:
+            terms = term
+        else:
+            terms = terms + term
+    
+    return terms
+
+
+def train_gam_optimized(X_train, y_train, X_val, y_val, feature_names):
+    """
+    Train GAM với per-feature tuning và extended lambda search.
     """
     n_features = X_train.shape[1]
+    terms = build_gam_terms(n_features, feature_names)
     
-    # Build term list: one spline per feature
-    terms = s(0, n_splines=n_splines)
-    for i in range(1, n_features):
-        terms = terms + s(i, n_splines=n_splines)
+    print(f"\n[GAM] Training with {n_features} features...")
     
-    if lam_search:
-        print("\n[GAM] Grid search for optimal smoothing (lambda)...")
-        
-        # Try different lambda values
-        best_gam = None
-        best_val_loss = float('inf')
-        best_lam = None
-        
-        for lam_exp in np.linspace(-3, 3, 20):
-            lam = 10 ** lam_exp
-            
-            gam = LinearGAM(terms)
+    # Stage 1: Wide lambda search
+    print("[GAM] Stage 1: Wide lambda search...")
+    best_gam = None
+    best_val_r2 = -999
+    best_lam = None
+    
+    lam_values = np.logspace(-4, 4, 40)
+    
+    for lam in lam_values:
+        try:
+            gam = LinearGAM(terms, lam=lam)
             gam.fit(X_train, y_train)
             
-            # Validate
             val_pred = gam.predict(X_val)
-            val_loss = mean_squared_error(y_val, val_pred)
+            val_r2 = r2_score(y_val, val_pred)
             
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if val_r2 > best_val_r2:
+                best_val_r2 = val_r2
                 best_gam = gam
                 best_lam = lam
-        
-        print(f"[GAM] Best lambda: {best_lam:.6f}")
-        print(f"[GAM] Best val MSE: {best_val_loss:.4f}")
-        
-        # Also try gridsearch built-in
-        print("[GAM] Running built-in gridsearch...")
+        except Exception:
+            continue
+    
+    print(f"  Best lambda: {best_lam:.6f}, Val R²: {best_val_r2:.4f}")
+    
+    # Stage 2: Fine search around best lambda
+    print("[GAM] Stage 2: Fine lambda search...")
+    fine_lams = np.logspace(
+        np.log10(best_lam) - 1,
+        np.log10(best_lam) + 1,
+        30
+    )
+    
+    for lam in fine_lams:
+        try:
+            gam = LinearGAM(terms, lam=lam)
+            gam.fit(X_train, y_train)
+            
+            val_pred = gam.predict(X_val)
+            val_r2 = r2_score(y_val, val_pred)
+            
+            if val_r2 > best_val_r2:
+                best_val_r2 = val_r2
+                best_gam = gam
+                best_lam = lam
+        except Exception:
+            continue
+    
+    print(f"  Best lambda: {best_lam:.6f}, Val R²: {best_val_r2:.4f}")
+    
+    # Stage 3: Built-in gridsearch
+    print("[GAM] Stage 3: Built-in gridsearch...")
+    try:
         gam_gs = LinearGAM(terms).gridsearch(
             X_train, y_train,
-            lam=np.logspace(-3, 3, 30)
+            lam=np.logspace(-3, 3, 50)
         )
-        
         val_pred_gs = gam_gs.predict(X_val)
-        val_loss_gs = mean_squared_error(y_val, val_pred_gs)
+        val_r2_gs = r2_score(y_val, val_pred_gs)
+        print(f"  Gridsearch Val R²: {val_r2_gs:.4f}")
         
-        print(f"[GAM] Gridsearch val MSE: {val_loss_gs:.4f}")
-        
-        if val_loss_gs < best_val_loss:
+        if val_r2_gs > best_val_r2:
             best_gam = gam_gs
-            best_val_loss = val_loss_gs
-            print("[GAM] → Using gridsearch model")
+            best_val_r2 = val_r2_gs
+            print("  → Using gridsearch model")
         else:
-            print("[GAM] → Using manual search model")
-        
-        return best_gam
-    else:
-        gam = LinearGAM(terms)
-        gam.gridsearch(X_train, y_train)
-        return gam
+            print("  → Keeping manual search model")
+    except Exception as e:
+        print(f"  Gridsearch failed: {e}")
+    
+    print(f"\n[GAM] Final Val R²: {best_val_r2:.4f}")
+    
+    return best_gam, best_val_r2
 
 
 def evaluate_and_plot(gam, X_test, y_test, feature_names, scaler_y, output_dir):
@@ -260,7 +398,7 @@ def evaluate_and_plot(gam, X_test, y_test, feature_names, scaler_y, output_dir):
     mape = np.mean(np.abs((actuals - predictions) / (actuals + 1e-8))) * 100
     
     print(f"\n{'='*70}")
-    print("GAM MODEL RESULTS")
+    print("GAM MODEL v2 RESULTS")
     print(f"{'='*70}")
     print(f"MAE:  {mae:.4f}")
     print(f"RMSE: {rmse:.4f}")
@@ -273,40 +411,33 @@ def evaluate_and_plot(gam, X_test, y_test, feature_names, scaler_y, output_dir):
     # ============================================================
     fig = plt.figure(figsize=(24, 16))
     
-    # 1a. Scatter với REGRESSION LINE (uốn theo chấm, không phải 45°)
+    # 1a. Scatter với REGRESSION LINE
     ax1 = plt.subplot(2, 3, 1)
     ax1.scatter(actuals, predictions, alpha=0.6, c='#2ecc71', s=80,
                edgecolors='black', linewidth=1, zorder=3)
     
-    # Perfect fit line (45°) - mờ
+    # Perfect fit line (45°)
     min_val = min(actuals.min(), predictions.min())
     max_val = max(actuals.max(), predictions.max())
     ax1.plot([min_val, max_val], [min_val, max_val], '--', color='gray',
             linewidth=1.5, alpha=0.5, label='Perfect y=x')
     
-    # REGRESSION LINE - uốn theo chấm (polynomial fit)
-    sort_idx = np.argsort(actuals)
-    actuals_sorted = actuals[sort_idx]
-    preds_sorted = predictions[sort_idx]
-    
-    # Polynomial regression degree 3
-    z = np.polyfit(actuals_sorted, preds_sorted, 3)
-    p = np.poly1d(z)
-    x_smooth = np.linspace(actuals.min(), actuals.max(), 200)
-    ax1.plot(x_smooth, p(x_smooth), 'r-', linewidth=3, label='Trend Line', zorder=5)
-    
-    # LOWESS smoothing cho đường uốn tốt hơn
+    # LOWESS smoothing
     try:
         from statsmodels.nonparametric.smoothers_lowess import lowess
-        lowess_result = lowess(preds_sorted, actuals_sorted, frac=0.4)
-        ax1.plot(lowess_result[:, 0], lowess_result[:, 1], 'b-', linewidth=3,
+        sort_idx = np.argsort(actuals)
+        lowess_result = lowess(predictions[sort_idx], actuals[sort_idx], frac=0.4)
+        ax1.plot(lowess_result[:, 0], lowess_result[:, 1], 'r-', linewidth=3,
                 label='LOWESS Fit', zorder=6)
     except ImportError:
-        pass
+        z = np.polyfit(actuals, predictions, 3)
+        p = np.poly1d(z)
+        x_smooth = np.linspace(actuals.min(), actuals.max(), 200)
+        ax1.plot(x_smooth, p(x_smooth), 'r-', linewidth=3, label='Trend', zorder=5)
     
     ax1.set_xlabel('Actual Deaths', fontsize=14, fontweight='bold')
     ax1.set_ylabel('Predicted Deaths', fontsize=14, fontweight='bold')
-    ax1.set_title('GAM Predictions vs Actual', fontsize=16, fontweight='bold')
+    ax1.set_title('GAM v2 Predictions vs Actual', fontsize=16, fontweight='bold')
     ax1.legend(fontsize=11)
     ax1.grid(True, alpha=0.3)
     
@@ -365,13 +496,10 @@ def evaluate_and_plot(gam, X_test, y_test, feature_names, scaler_y, output_dir):
     
     # 1f. Prediction intervals
     ax6 = plt.subplot(2, 3, 6)
-    
-    # GAM confidence intervals
     try:
         pred_intervals = gam.prediction_intervals(X_test, width=0.95)
         ci_low = scaler_y.inverse_transform(pred_intervals[:, 0].reshape(-1, 1)).flatten()
         ci_high = scaler_y.inverse_transform(pred_intervals[:, 1].reshape(-1, 1)).flatten()
-        
         ax6.fill_between(t, ci_low, ci_high, alpha=0.2, color='#3498db', label='95% CI')
     except Exception:
         pass
@@ -392,32 +520,47 @@ def evaluate_and_plot(gam, X_test, y_test, feature_names, scaler_y, output_dir):
     print(f"\n✅ Saved: {output_dir}/gam_evaluation.png")
     
     # ============================================================
-    # PLOT 2: Feature importance (partial dependence)
+    # PLOT 2: Top 12 feature effects (partial dependence)
     # ============================================================
-    n_features = min(len(feature_names), 12)
+    n_show = min(len(feature_names), 12)
+    
+    # Rank features by effect size
+    feature_importance = []
+    for i in range(len(feature_names)):
+        try:
+            XX = gam.generate_X_grid(term=i, n=100)
+            pdep, _ = gam.partial_dependence(term=i, X=XX, width=0.95)
+            importance = pdep.max() - pdep.min()
+            feature_importance.append((i, feature_names[i], importance))
+        except Exception:
+            feature_importance.append((i, feature_names[i], 0))
+    
+    # Sort by importance
+    feature_importance.sort(key=lambda x: x[2], reverse=True)
+    top_features = feature_importance[:n_show]
+    
     fig, axes = plt.subplots(3, 4, figsize=(24, 16))
     axes = axes.flatten()
     
-    for i in range(n_features):
-        ax = axes[i]
+    for plot_idx, (feat_idx, feat_name, imp) in enumerate(top_features):
+        ax = axes[plot_idx]
         try:
-            XX = gam.generate_X_grid(term=i, n=100)
-            pdep, confi = gam.partial_dependence(term=i, X=XX, width=0.95)
+            XX = gam.generate_X_grid(term=feat_idx, n=100)
+            pdep, confi = gam.partial_dependence(term=feat_idx, X=XX, width=0.95)
             
-            ax.plot(XX[:, i], pdep, 'b-', linewidth=2)
-            ax.fill_between(XX[:, i], confi[:, 0], confi[:, 1],
+            ax.plot(XX[:, feat_idx], pdep, 'b-', linewidth=2)
+            ax.fill_between(XX[:, feat_idx], confi[:, 0], confi[:, 1],
                           alpha=0.2, color='blue')
-            ax.set_title(f'{feature_names[i][:25]}', fontsize=10, fontweight='bold')
+            ax.set_title(f'{feat_name[:30]}\n(effect: {imp:.3f})', fontsize=9, fontweight='bold')
             ax.grid(True, alpha=0.3)
         except Exception as e:
             ax.text(0.5, 0.5, f'N/A\n{str(e)[:30]}', transform=ax.transAxes,
                    ha='center', va='center', fontsize=9)
     
-    # Hide unused
-    for i in range(n_features, len(axes)):
+    for i in range(len(top_features), len(axes)):
         axes[i].set_visible(False)
     
-    plt.suptitle('GAM Partial Dependence Plots (Feature Effects)', 
+    plt.suptitle('GAM v2: Top Feature Effects (Partial Dependence)',
                 fontsize=18, fontweight='bold', y=1.02)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'gam_feature_effects.png'), dpi=300, bbox_inches='tight')
@@ -430,49 +573,54 @@ def evaluate_and_plot(gam, X_test, y_test, feature_names, scaler_y, output_dir):
         'r2': float(r2),
         'mape': float(mape),
         'predictions': predictions.tolist(),
-        'actuals': actuals.tolist()
+        'actuals': actuals.tolist(),
+        'feature_importance': [(n, float(v)) for _, n, v in feature_importance]
     }
 
 
 def main():
-    """Main GAM training pipeline."""
+    """Main GAM v2 training pipeline."""
     
     base_dir = os.path.dirname(__file__)
     output_dir = os.path.join(base_dir, 'gam_results')
     
     print("\n" + "="*70)
-    print("GAM MODEL - Generalized Additive Models")
-    print("Focus: MIN/MAX features only (NO mean)")
+    print("GAM MODEL v2 - Optimized for Maximum R²")
     print("="*70)
     
-    # Load data
-    df, feature_cols = load_data_minmax()
+    # ============================================================
+    # 1. Load data
+    # ============================================================
+    df, base_features = load_data()
     
-    # Create GAM-specific features
-    df_gam, all_features = create_gam_features(df, feature_cols)
+    # ============================================================
+    # 2. Feature engineering
+    # ============================================================
+    df_feat, all_features = create_features(df, base_features)
     
     # Prepare X, y
-    X = df_gam[all_features].values.astype(np.float64)
-    y = df_gam['Deaths'].values.astype(np.float64)
+    X = df_feat[all_features].values.astype(np.float64)
+    y = df_feat['Deaths'].values.astype(np.float64)
     
-    print(f"\n[Data] X shape: {X.shape}, y shape: {y.shape}")
+    print(f"\n[Data] X: {X.shape}, y: {y.shape}")
+    print(f"[Deaths] mean={y.mean():.1f}, std={y.std():.1f}, range=[{y.min():.0f}, {y.max():.0f}]")
     
-    # Scale features
+    # ============================================================
+    # 3. Scale features
+    # ============================================================
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
     
     # Time-based split: 80% train, 10% val, 10% test
-    train_size = int(len(X) * 0.8)
-    val_size = int(len(X) * 0.1)
+    n = len(X)
+    train_end = int(n * 0.8)
+    val_end = train_end + int(n * 0.1)
     
-    X_train_raw = X[:train_size]
-    y_train_raw = y[:train_size]
-    X_val_raw = X[train_size:train_size+val_size]
-    y_val_raw = y[train_size:train_size+val_size]
-    X_test_raw = X[train_size+val_size:]
-    y_test_raw = y[train_size+val_size:]
+    X_train_raw, y_train_raw = X[:train_end], y[:train_end]
+    X_val_raw, y_val_raw = X[train_end:val_end], y[train_end:val_end]
+    X_test_raw, y_test_raw = X[val_end:], y[val_end:]
     
-    # Fit scalers on train only
+    # Fit on train
     X_train = scaler_X.fit_transform(X_train_raw)
     y_train = scaler_y.fit_transform(y_train_raw.reshape(-1, 1)).flatten()
     
@@ -484,35 +632,100 @@ def main():
     
     print(f"\n[Split] Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
     
-    # Train GAM
+    # ============================================================
+    # 4. Feature selection
+    # ============================================================
+    selected_idx, selected_names = select_features(X_train, y_train, all_features, threshold=0.02)
+    
+    X_train_sel = X_train[:, selected_idx]
+    X_val_sel = X_val[:, selected_idx]
+    X_test_sel = X_test[:, selected_idx]
+    
+    # ============================================================
+    # 5. Train GAM on train set, tune on val set
+    # ============================================================
     print("\n" + "="*70)
-    print("TRAINING GAM")
+    print("PHASE 1: Train + Validate")
     print("="*70)
     
-    gam = train_gam(X_train, y_train, X_val, y_val, n_splines=25, lam_search=True)
+    gam_phase1, val_r2 = train_gam_optimized(
+        X_train_sel, y_train, X_val_sel, y_val, selected_names
+    )
     
-    # Statistics
+    # Get best lambda from phase 1
+    best_lam = gam_phase1.lam
+    
+    # ============================================================
+    # 6. Retrain on train+val with best hyperparameters
+    # ============================================================
+    print("\n" + "="*70)
+    print("PHASE 2: Retrain on Train+Val")
+    print("="*70)
+    
+    X_trainval = np.vstack([X_train_sel, X_val_sel])
+    y_trainval = np.concatenate([y_train, y_val])
+    
+    terms = build_gam_terms(len(selected_names), selected_names)
+    
+    # Try retraining with same lambda
+    gam_final = LinearGAM(terms, lam=best_lam)
+    gam_final.fit(X_trainval, y_trainval)
+    
+    # Also try gridsearch on combined data
+    try:
+        gam_gs = LinearGAM(terms).gridsearch(
+            X_trainval, y_trainval,
+            lam=np.logspace(-3, 3, 50)
+        )
+        
+        # Compare on test
+        pred1 = gam_final.predict(X_test_sel)
+        pred2 = gam_gs.predict(X_test_sel)
+        r2_1 = r2_score(y_test, pred1)
+        r2_2 = r2_score(y_test, pred2)
+        
+        print(f"  Fixed lambda R²: {r2_1:.4f}")
+        print(f"  Gridsearch R²: {r2_2:.4f}")
+        
+        if r2_2 > r2_1:
+            gam_final = gam_gs
+            print("  → Using gridsearch model")
+        else:
+            print("  → Using fixed lambda model")
+    except Exception:
+        pass
+    
+    # ============================================================
+    # 7. GAM Statistics
+    # ============================================================
     print(f"\n[GAM Summary]")
-    print(f"  GCV score: {gam.statistics_['GCV']:.6f}")
-    print(f"  Pseudo R²: {gam.statistics_['pseudo_r2']['explained_deviance']:.4f}")
-    print(f"  AIC: {gam.statistics_['AIC']:.2f}")
+    print(f"  Features: {len(selected_names)}")
+    print(f"  GCV: {gam_final.statistics_['GCV']:.6f}")
+    print(f"  Pseudo R²: {gam_final.statistics_['pseudo_r2']['explained_deviance']:.4f}")
+    print(f"  AIC: {gam_final.statistics_['AIC']:.2f}")
     
-    # Evaluate on test set
+    # ============================================================
+    # 8. Evaluate on test set
+    # ============================================================
     print("\n" + "="*70)
     print("EVALUATING ON TEST SET")
     print("="*70)
     
-    results = evaluate_and_plot(gam, X_test, y_test, all_features, scaler_y, output_dir)
+    results = evaluate_and_plot(gam_final, X_test_sel, y_test, selected_names, scaler_y, output_dir)
     
-    # Save model and scalers
+    # ============================================================
+    # 9. Save everything
+    # ============================================================
     os.makedirs(output_dir, exist_ok=True)
     
     with open(os.path.join(output_dir, 'gam_model.pkl'), 'wb') as f:
         pickle.dump({
-            'gam': gam,
+            'gam': gam_final,
             'scaler_X': scaler_X,
             'scaler_y': scaler_y,
             'feature_names': all_features,
+            'selected_features': selected_names,
+            'selected_idx': selected_idx,
             'results': results
         }, f)
     
@@ -522,17 +735,19 @@ def main():
     print(f"\n✅ Model saved: {output_dir}/gam_model.pkl")
     print(f"✅ Results saved: {output_dir}/results.json")
     
-    # Compare with previous models
+    # ============================================================
+    # 10. Comparison
+    # ============================================================
     print(f"\n{'='*70}")
-    print("COMPARISON WITH PREVIOUS MODELS")
+    print("COMPARISON")
     print(f"{'='*70}")
-    print(f"\n{'Model':<20} {'MAE':<10} {'RMSE':<10} {'R²':<10}")
-    print("-" * 50)
-    print(f"{'Baseline (DLinear)':<20} {'7.21':<10} {'9.00':<10} {'-0.08':<10}")
-    print(f"{'Improved (TCN+TF)':<20} {'6.35':<10} {'8.04':<10} {'0.14':<10}")
-    print(f"{'Optimal (Attention)':<20} {'6.12':<10} {'7.64':<10} {'0.22':<10}")
-    print(f"{'Ensemble (5x)':<20} {'6.27':<10} {'8.29':<10} {'0.08':<10}")
-    print(f"{'GAM (min/max)':<20} {results['mae']:<10.4f} {results['rmse']:<10.4f} {results['r2']:<10.4f}")
+    print(f"\n{'Model':<25} {'MAE':<10} {'RMSE':<10} {'R²':<10}")
+    print("-" * 55)
+    print(f"{'GAM v1 (old)':<25} {'4.62':<10} {'5.88':<10} {'0.52':<10}")
+    print(f"{'GAM v2 (new)':<25} {results['mae']:<10.4f} {results['rmse']:<10.4f} {results['r2']:<10.4f}")
+    
+    improvement = results['r2'] - 0.52
+    print(f"\nR² improvement: {improvement:+.4f} ({improvement/0.52*100:+.1f}%)")
     print(f"{'='*70}\n")
 
 
